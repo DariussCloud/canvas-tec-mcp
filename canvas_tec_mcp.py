@@ -9,8 +9,10 @@
 #   "python-docx>=1.1",
 #   "playwright==1.64.1",
 #   "cryptography>=42",
+#   "tzdata>=2024.1; sys_platform == 'win32'",
 # ]
 # ///
+import base64
 import json
 import logging
 import os
@@ -42,7 +44,8 @@ SESSION_FILE = CONFIG / "session.json"
 KEYCHAIN_SERVICE = "canvas-tec-session"
 IDP_HOSTS = {h.strip() for h in os.environ.get("CANVAS_IDP_HOSTS", "amfs.tec.mx,aamfa.tec.mx").split(",") if h.strip()}
 MAX_RPS = float(os.environ.get("CANVAS_MAX_RPS", "5"))
-LOGIN_CMD = f"uv run --script {Path(__file__).resolve()} --login"
+SCRIPT = Path(__file__).resolve()
+LOGIN_CMD = f'uv run --script "{SCRIPT}" --login' if " " in str(SCRIPT) else f"uv run --script {SCRIPT} --login"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 BLOCK_TAGS = ["p", "div", "br", "li", "ul", "ol", "tr", "table", "section", "blockquote", "pre", "h1", "h2", "h3", "h4", "h5", "h6"]
 TEXT_SUFFIXES = {".txt", ".md", ".csv", ".json", ".py", ".m", ".c", ".cpp", ".h", ".ino", ".html", ".xml", ".tex"}
@@ -90,22 +93,76 @@ def keychain_key(create: bool = False) -> bytes | None:
         return None
 
 
+def dpapi(data: bytes, protect: bool) -> bytes:
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(out)):
+        raise OSError("DPAPI no pudo procesar la sesión")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def seal(raw: bytes) -> bytes:
+    if os.environ.get("CANVAS_SESSION_STORE") == "file":
+        return raw
+    if sys.platform == "win32":
+        try:
+            return b"DPAPI:" + base64.b64encode(dpapi(raw, True))
+        except OSError:
+            return raw
+    key = keychain_key(create=True)
+    if key:
+        from cryptography.fernet import Fernet
+        return Fernet(key).encrypt(raw)
+    return raw
+
+
+def unseal(payload: bytes) -> dict:
+    if payload.lstrip().startswith(b"{"):
+        return json.loads(payload)
+    if payload.startswith(b"DPAPI:"):
+        try:
+            return json.loads(dpapi(base64.b64decode(payload[6:]), False))
+        except (OSError, ValueError):
+            return {}
+    key = keychain_key()
+    if not key:
+        return {}
+    from cryptography.fernet import Fernet, InvalidToken
+    try:
+        return json.loads(Fernet(key).decrypt(payload))
+    except InvalidToken:
+        return {}
+
+
 def session_location() -> str:
-    if SESSION_FILE.exists() and not SESSION_FILE.read_bytes().lstrip().startswith(b"{"):
-        return f"{SESSION_FILE} (cifrado; llave en Llavero '{KEYCHAIN_SERVICE}')"
-    return str(SESSION_FILE)
+    if not SESSION_FILE.exists():
+        return str(SESSION_FILE)
+    head = SESSION_FILE.read_bytes()[:8]
+    if head.startswith(b"DPAPI:"):
+        return f"{SESSION_FILE} (cifrado con DPAPI de Windows)"
+    if head.lstrip().startswith(b"{"):
+        return str(SESSION_FILE)
+    return f"{SESSION_FILE} (cifrado; llave en Llavero '{KEYCHAIN_SERVICE}')"
 
 
 def save_session(data: dict) -> str:
     CONFIG.mkdir(parents=True, exist_ok=True)
     os.chmod(CONFIG, 0o700)
-    raw = json.dumps(data).encode()
-    key = keychain_key(create=True)
-    if key:
-        from cryptography.fernet import Fernet
-        raw = Fernet(key).encrypt(raw)
+    raw = seal(json.dumps(data).encode())
     tmp = SESSION_FILE.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(fd, "wb") as fh:
         fh.write(raw)
     os.chmod(tmp, 0o600)
@@ -116,17 +173,7 @@ def save_session(data: dict) -> str:
 def load_session() -> dict:
     if not SESSION_FILE.exists():
         return {}
-    payload = SESSION_FILE.read_bytes()
-    if payload.lstrip().startswith(b"{"):
-        return json.loads(payload)
-    key = keychain_key()
-    if not key:
-        return {}
-    from cryptography.fernet import Fernet, InvalidToken
-    try:
-        return json.loads(Fernet(key).decrypt(payload))
-    except InvalidToken:
-        return {}
+    return unseal(SESSION_FILE.read_bytes())
 
 
 def keep_cookie(c: dict) -> bool:
@@ -372,8 +419,9 @@ def safe_name(name: str) -> str:
 
 
 def convert_legacy(path: Path) -> Path | None:
-    office = shutil.which("soffice") or "/Applications/LibreOffice.app/Contents/MacOS/soffice"
-    if not Path(office).exists() and not shutil.which(office):
+    candidates = ["/Applications/LibreOffice.app/Contents/MacOS/soffice", r"C:\Program Files\LibreOffice\program\soffice.exe"]
+    office = shutil.which("soffice") or next((c for c in candidates if Path(c).exists()), None)
+    if not office:
         return None
     target = {".ppt": "pptx", ".doc": "docx"}[path.suffix.lower()]
     out_dir = Path(tempfile.mkdtemp())
@@ -884,6 +932,13 @@ def session_status() -> dict:
 
 
 def palette() -> tuple[str, ...]:
+    if os.name == "nt":
+        os.system("")
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     return "\033[32m", "\033[31m", "\033[36m", "\033[2m", "\033[1m", "\033[33m", "\033[0m"
 
 

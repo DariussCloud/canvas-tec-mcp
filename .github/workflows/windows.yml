@@ -1,0 +1,34 @@
+name: windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install.ps1 -SkipLogin (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File install.ps1 -SkipLogin
+
+      - name: Config de Claude Desktop
+        shell: powershell
+        run: |
+          $cfg = Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" -Raw | ConvertFrom-Json
+          if (-not $cfg.mcpServers.'canvas-tec') { throw "falta canvas-tec en la config" }
+          $cfg.mcpServers.'canvas-tec' | ConvertTo-Json
+
+      - name: Prueba de humo
+        shell: powershell
+        run: |
+          $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
+          if (-not $uv) { $uv = "$HOME\.local\bin\uv.exe" }
+          $script = "$HOME\mcp\canvas-tec\canvas_tec_mcp.py"
+          $req = Join-Path $env:RUNNER_TEMP "requirements.txt"
+          & $uv export --script $script --no-hashes --quiet -o $req
+          & $uv run --no-project --with-requirements $req python tests\smoke.py $script $uv
+          if ($LASTEXITCODE -ne 0) { exit 1 }
