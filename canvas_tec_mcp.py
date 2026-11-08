@@ -257,6 +257,19 @@ class CanvasClient(httpx.Client):
             if c["domain"].lstrip(".") == HOST:
                 self.cookies.set(c["name"], c["value"], domain=HOST, path=c.get("path") or "/")
 
+    def keep_rotation(self) -> None:
+        try:
+            current = self.cookies.get("canvas_session", domain=HOST)
+        except httpx.CookieConflict:
+            return
+        stored = next((c for c in self.session.get("cookies", []) if c["name"] == "canvas_session" and c["domain"].lstrip(".") == HOST), None)
+        if current and stored and stored["value"] != current:
+            stored["value"] = current
+            try:
+                save_session(self.session)
+            except OSError:
+                pass
+
     def csrf(self) -> str | None:
         try:
             value = self.cookies.get("_csrf_token", domain=HOST)
@@ -328,6 +341,8 @@ class CanvasClient(httpx.Client):
                 request.headers.pop("Cookie", None)
                 self.cookies.set_cookie_header(request)
                 continue
+            if self.mode == "session" and own:
+                self.keep_rotation()
             return r
         return r
 
