@@ -1,0 +1,9 @@
+session.json
+*.session.json
+browser-profile/
+recon-cookies.json
+*.har
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
